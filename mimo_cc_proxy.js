@@ -8,7 +8,7 @@ const { URL } = require("node:url");
 const LISTEN_HOST = process.env.MIMO_CC_PROXY_HOST || "127.0.0.1";
 const LISTEN_PORT = Number(process.env.MIMO_CC_PROXY_PORT || "3456");
 const UPSTREAM_BASE_URL =
-  process.env.MIMO_CC_UPSTREAM || "http://newai.cmiteam.cn";
+  process.env.MIMO_CC_UPSTREAM || "yourproxy";
 const REQUEST_TIMEOUT_MS = Number(
   process.env.MIMO_CC_PROXY_TIMEOUT_MS || "300000",
 );
