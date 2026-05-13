@@ -1,28 +1,29 @@
 # MiMo Claude Code Proxy
 
-A local compatibility proxy for running Claude Code against Xiaomi MiMo models through an OpenAI-style relay while preserving multi-turn `reasoning_content` across tool calls.
+A local compatibility proxy that lets Claude Code talk to Xiaomi MiMo models through an OpenAI-style relay while preserving MiMo's required `reasoning_content` history.
 
-Chinese README: [README.zh-CN.md](./README.zh-CN.md)
+## What this fixes
 
-## Why this exists
-
-MiMo's recent tool-calling requirement is stricter than many Anthropic-compatible clients expect:
+MiMo thinking mode is stricter than many Anthropic-compatible clients:
 
 - in multi-turn agent conversations
-- when thinking mode is enabled
-- and assistant turns contain tool calls
+- when earlier assistant turns used tools
+- and later requests replay those assistant turns
 
-the full assistant turn, including `reasoning_content`, must be sent back on later requests.
+MiMo expects the full assistant history, including `reasoning_content`, to be sent back. If that reasoning history is missing, the upstream can return `400 Param Incorrect`.
 
-Claude Code currently talks to Anthropic-style `/v1/messages`, while MiMo's officially documented behavior is centered on OpenAI-style `/v1/chat/completions` with `reasoning_content`.
+Claude Code speaks Anthropic-style `POST /v1/messages`, while MiMo documents this behavior around OpenAI-style `POST /v1/chat/completions`.
 
-This proxy bridges that gap:
+This proxy bridges the two formats and keeps the missing reasoning/tool context intact.
 
-- accepts Anthropic-style `POST /v1/messages`
-- converts requests to OpenAI-style `POST /v1/chat/completions`
-- enables MiMo thinking mode explicitly
-- maps MiMo `reasoning_content` back into Anthropic-style `thinking` blocks
-- carries tool call / tool result turns across rounds
+## What this version adds
+
+- full streaming bridge: Anthropic SSE <-> OpenAI chat completions stream
+- non-streaming fallback path for clients that do not request streaming
+- `MIMO_CC_THINKING_MODE=on|off`, defaulting to `on`
+- MiMo `reasoning_content` mapped back to Anthropic `thinking` blocks
+- tool call / tool result roundtrips preserved across turns
+- timing logs for stream mode, first upstream chunk, first emitted Anthropic event, and total time
 
 ## Tested target
 
@@ -39,6 +40,7 @@ No npm dependencies are required.
 ## Files
 
 - `mimo_cc_proxy.js`: main proxy
+- `README.zh-CN.md`: Chinese README
 - `examples/claude-settings.example.json`: Claude Code settings example
 - `examples/proxy.env.example`: proxy environment example
 
@@ -54,17 +56,17 @@ By default it listens on `http://127.0.0.1:3456` and forwards to `http://newai.c
 
 ### 2. Point Claude Code to the proxy
 
-Set Claude Code to use:
+Use these Claude Code settings:
 
 - `ANTHROPIC_BASE_URL=http://127.0.0.1:3456`
 - `ANTHROPIC_MODEL=mimo-v2.5-pro`
-- your existing relay key in `ANTHROPIC_AUTH_TOKEN`
+- your relay key in `ANTHROPIC_AUTH_TOKEN`
 
 See `examples/claude-settings.example.json`.
 
 ### 3. Restart Claude Code
 
-Start a fresh conversation rather than resuming a broken old session.
+For performance validation, start a fresh conversation instead of resuming a very large old thread.
 
 ## Environment variables
 
@@ -73,39 +75,32 @@ MIMO_CC_PROXY_HOST=127.0.0.1
 MIMO_CC_PROXY_PORT=3456
 MIMO_CC_UPSTREAM=http://newai.cmiteam.cn
 MIMO_CC_PROXY_TIMEOUT_MS=300000
+MIMO_CC_THINKING_MODE=on
 ```
 
-## What the proxy translates
+`MIMO_CC_THINKING_MODE` behavior:
 
-### Request path
+- `on`: default, sends `thinking: { type: "enabled" }` upstream
+- `off`: disables MiMo thinking without changing Claude Code config
 
-Claude Code request:
+## How the proxy behaves
 
-- Anthropic-style `POST /v1/messages`
+### Request routing
 
-Proxy forwards as:
+- `POST /v1/messages` -> translated into OpenAI-style `POST /v1/chat/completions`
+- `stream: true` -> real stream bridge when upstream returns SSE
+- `stream: false` or omitted -> JSON bridge
 
-- OpenAI-style `POST /v1/chat/completions`
+### Block mapping
 
-### Assistant message mapping
+- Anthropic `thinking` -> OpenAI `reasoning_content`
+- Anthropic `text` -> OpenAI `content`
+- Anthropic `tool_use` -> OpenAI `tool_calls`
+- Anthropic `tool_result` -> OpenAI `role: "tool"`
 
-Anthropic assistant blocks:
+### Stream fallback
 
-- `thinking`
-- `text`
-- `tool_use`
-
-are converted into OpenAI chat message fields:
-
-- `reasoning_content`
-- `content`
-- `tool_calls`
-
-### Tool result mapping
-
-Anthropic user-side `tool_result` blocks are converted into:
-
-- OpenAI `role: "tool"`
+If the upstream receives `stream: true` but returns a non-SSE JSON body, the proxy converts that full JSON reply into Anthropic-style SSE so Claude Code still gets a streaming-shaped response.
 
 ## Validation commands
 
@@ -115,28 +110,81 @@ Anthropic user-side `tool_result` blocks are converted into:
 node --check mimo_cc_proxy.js
 ```
 
-### Basic ping through the proxy
+### Non-streaming ping
 
 ```bash
 curl -s -X POST http://127.0.0.1:3456/v1/messages \
   -H 'content-type: application/json' \
   -H 'x-api-key: YOUR_RELAY_KEY' \
   -H 'anthropic-version: 2023-06-01' \
-  --data '{"model":"mimo-v2.5-pro","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}'
+  --data '{"model":"mimo-v2.5-pro","max_tokens":32,"messages":[{"role":"user","content":"ping"}]}'
 ```
 
-## Known limitations
+### Streaming text check
 
-- currently built for non-streaming `POST /v1/messages`
-- designed for MiMo via OpenAI chat completions, not generic Anthropic upstreams
-- only bridges the Claude Code path that mattered for this MiMo fix
+```bash
+curl -N -X POST http://127.0.0.1:3456/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: YOUR_RELAY_KEY' \
+  -H 'anthropic-version: 2023-06-01' \
+  --data '{"model":"mimo-v2.5-pro","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"Reply with one short sentence."}]}'
+```
+
+Expected shape:
+
+- `event: message_start`
+- `event: content_block_start`
+- one or more `event: content_block_delta`
+- `event: content_block_stop`
+- `event: message_delta`
+- `event: message_stop`
+
+## Troubleshooting
+
+### Claude Code still feels slow
+
+This proxy removes the biggest local bottleneck when the previous setup forced non-streaming replies, but two things can still make the experience feel slow:
+
+- MiMo thinking mode itself can add latency
+- very large old Claude Code threads still take longer because the upstream context is large
+
+For a fair comparison, validate with a fresh Claude Code conversation.
+
+If you want lower latency, keep the same Claude Code settings and start the proxy with:
+
+```bash
+MIMO_CC_THINKING_MODE=off node mimo_cc_proxy.js
+```
+
+### How to inspect timing
+
+The proxy writes structured logs like this:
+
+```text
+[mimo-cc-proxy] {"mode":"stream","thinkingMode":"on","upstreamConnectedMs":123,"firstUpstreamChunkMs":412,"firstAnthropicEventMs":414,"totalMs":1860}
+```
+
+Useful fields:
+
+- `mode`: `stream` or `json`
+- `thinkingMode`: `on` or `off`
+- `upstreamConnectedMs`: time to upstream response headers
+- `firstUpstreamChunkMs`: time to first upstream stream chunk
+- `firstAnthropicEventMs`: time to first emitted Anthropic SSE event
+- `totalMs`: full request time
+
+## Known scope
+
+- focused on Claude Code + MiMo compatibility, not a general-purpose Anthropic/OpenAI gateway
+- optimized for MiMo models that require reasoning replay across tool rounds
+- keeps the external Claude Code interface unchanged: `ANTHROPIC_BASE_URL=http://127.0.0.1:3456`
 
 ## Suggested repo description
 
-`Local Claude Code compatibility proxy for Xiaomi MiMo reasoning_content + tool-call roundtrips`
+`Local Claude Code proxy for Xiaomi MiMo with reasoning_content replay, tool-call compatibility, and Anthropic SSE streaming`
 
 ## Before publishing
 
-- replace example placeholders with your own values locally only
 - do not commit real API keys
-- add a license file if you want others to reuse it formally
+- replace relay placeholders locally if you do not want to expose your relay host
+- add a license if you want formal reuse terms
