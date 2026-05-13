@@ -5,7 +5,8 @@
   "private": false,
   "scripts": {
     "start": "node mimo_cc_proxy.js",
-    "check": "node --check mimo_cc_proxy.js"
+    "check": "node --check mimo_cc_proxy.js",
+    "smoke": "node tests/smoke_proxy.js"
   },
   "keywords": [
     "claude-code",
