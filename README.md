@@ -2,6 +2,8 @@
 
 A local compatibility proxy for running Claude Code against Xiaomi MiMo models through an OpenAI-style relay while preserving multi-turn `reasoning_content` across tool calls.
 
+Chinese README: [README.zh-CN.md](./README.zh-CN.md)
+
 ## Why this exists
 
 MiMo's recent tool-calling requirement is stricter than many Anthropic-compatible clients expect:
