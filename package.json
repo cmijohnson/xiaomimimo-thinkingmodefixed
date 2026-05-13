@@ -1,0 +1,21 @@
+{
+  "name": "mimo-claude-code-proxy",
+  "version": "0.1.0",
+  "description": "Local compatibility proxy that bridges Claude Code Anthropic messages to MiMo OpenAI chat completions with reasoning_content roundtrips.",
+  "private": false,
+  "scripts": {
+    "start": "node mimo_cc_proxy.js",
+    "check": "node --check mimo_cc_proxy.js"
+  },
+  "keywords": [
+    "claude-code",
+    "mimo",
+    "proxy",
+    "anthropic",
+    "openai",
+    "reasoning-content"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
