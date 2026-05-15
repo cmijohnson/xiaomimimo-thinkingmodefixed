@@ -13,6 +13,12 @@ const REQUEST_TIMEOUT_MS = Number(
   process.env.MIMO_CC_PROXY_TIMEOUT_MS || "300000",
 );
 const DEFAULT_THINKING_MODE = "on";
+const UPSTREAM_KEEPALIVE_MS = Number(
+  process.env.MIMO_CC_PROXY_KEEPALIVE_MS || "30000",
+);
+const MAX_UPSTREAM_SOCKETS = Number(
+  process.env.MIMO_CC_PROXY_MAX_SOCKETS || "64",
+);
 const SSE_HEADERS = {
   "content-type": "text/event-stream; charset=utf-8",
   "cache-control": "no-cache, no-transform",
@@ -20,6 +26,22 @@ const SSE_HEADERS = {
   "x-accel-buffering": "no",
 };
 const BLOCK_CHUNK_SIZE = 96;
+const HTTP_UPSTREAM_AGENT = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: UPSTREAM_KEEPALIVE_MS,
+  maxSockets: MAX_UPSTREAM_SOCKETS,
+  maxFreeSockets: Math.min(16, MAX_UPSTREAM_SOCKETS),
+  scheduling: "lifo",
+  timeout: REQUEST_TIMEOUT_MS,
+});
+const HTTPS_UPSTREAM_AGENT = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: UPSTREAM_KEEPALIVE_MS,
+  maxSockets: MAX_UPSTREAM_SOCKETS,
+  maxFreeSockets: Math.min(16, MAX_UPSTREAM_SOCKETS),
+  scheduling: "lifo",
+  timeout: REQUEST_TIMEOUT_MS,
+});
 
 function readRequestBody(req) {
   return new Promise((resolve, reject) => {
@@ -49,6 +71,40 @@ function copyHeaders(headers) {
   delete nextHeaders.host;
   delete nextHeaders["content-length"];
   return nextHeaders;
+}
+
+function requestPathname(requestUrl) {
+  if (!requestUrl) {
+    return "";
+  }
+
+  try {
+    const { pathname } = new URL(requestUrl, "http://127.0.0.1");
+    if (pathname.length > 1 && pathname.endsWith("/")) {
+      return pathname.slice(0, -1);
+    }
+    return pathname;
+  } catch {
+    return requestUrl;
+  }
+}
+
+function isAnthropicMessagesPath(requestUrl) {
+  return requestPathname(requestUrl) === "/v1/messages";
+}
+
+function isAnthropicCountTokensPath(requestUrl) {
+  return requestPathname(requestUrl) === "/v1/messages/count_tokens";
+}
+
+function getUpstreamTransport(upstreamUrl) {
+  return upstreamUrl.protocol === "https:" ? https : http;
+}
+
+function getUpstreamAgent(upstreamUrl) {
+  return upstreamUrl.protocol === "https:" ?
+      HTTPS_UPSTREAM_AGENT :
+      HTTP_UPSTREAM_AGENT;
 }
 
 function blocksFromContent(content) {
@@ -89,6 +145,139 @@ function textFromAnthropicContent(content) {
     .map((block) => blockText(block))
     .filter(Boolean)
     .join("\n");
+}
+
+function estimateTokensFromString(value) {
+  if (!value) {
+    return 0;
+  }
+
+  const text = String(value);
+  let asciiCount = 0;
+  let nonAsciiCount = 0;
+  let whitespaceCount = 0;
+  let punctuationCount = 0;
+
+  for (const char of text) {
+    if (/\s/u.test(char)) {
+      whitespaceCount += 1;
+      continue;
+    }
+
+    if (/\p{P}|\p{S}/u.test(char)) {
+      punctuationCount += 1;
+    }
+
+    if (char.charCodeAt(0) <= 0x7f) {
+      asciiCount += 1;
+    } else {
+      nonAsciiCount += 1;
+    }
+  }
+
+  return Math.max(
+    1,
+    Math.ceil(
+      asciiCount / 3.6 +
+        nonAsciiCount * 1.18 +
+        whitespaceCount * 0.1 +
+        punctuationCount * 0.15,
+    ),
+  );
+}
+
+function estimateTokensFromValue(value) {
+  if (value == null) {
+    return 0;
+  }
+
+  if (typeof value === "string") {
+    return estimateTokensFromString(value);
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return 1;
+  }
+
+  if (Array.isArray(value)) {
+    return 2 + value.reduce((sum, item) => sum + estimateTokensFromValue(item), 0);
+  }
+
+  if (typeof value === "object") {
+    return (
+      4 +
+      Object.entries(value).reduce(
+        (sum, [key, item]) =>
+          sum + estimateTokensFromString(key) + estimateTokensFromValue(item),
+        0,
+      )
+    );
+  }
+
+  return estimateTokensFromString(String(value));
+}
+
+function estimateTokensFromContentBlocks(content) {
+  const blocks = blocksFromContent(content);
+  let total = 0;
+
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") {
+      continue;
+    }
+
+    if (block.type === "tool_use") {
+      total +=
+        12 +
+        estimateTokensFromString(block.id) +
+        estimateTokensFromString(block.name) +
+        estimateTokensFromValue(block.input || {});
+      continue;
+    }
+
+    if (block.type === "tool_result") {
+      total +=
+        10 +
+        estimateTokensFromString(block.tool_use_id) +
+        estimateTokensFromContentBlocks(block.content);
+      continue;
+    }
+
+    total += estimateTokensFromString(blockText(block));
+  }
+
+  return total;
+}
+
+function estimateAnthropicCountTokens(body) {
+  let total = 8;
+
+  total += estimateTokensFromString(body.model);
+  total += estimateTokensFromString(textFromAnthropicContent(body.system));
+
+  if (Array.isArray(body.messages)) {
+    for (const message of body.messages) {
+      total += 6;
+      total += estimateTokensFromString(message?.role);
+      total += estimateTokensFromContentBlocks(message?.content);
+    }
+  }
+
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) {
+      total +=
+        20 +
+        estimateTokensFromString(tool?.name) +
+        estimateTokensFromString(tool?.description) +
+        estimateTokensFromValue(tool?.input_schema);
+    }
+  }
+
+  if (body.tool_choice) {
+    total += 4 + estimateTokensFromValue(body.tool_choice);
+  }
+
+  return Math.max(1, Math.ceil(total * 1.08));
 }
 
 function mergeAssistantGroup(group) {
@@ -460,7 +649,7 @@ function resolveUpstreamHeaders(clientHeaders) {
 
 function requestUpstreamJson(upstreamUrl, method, headers, bodyBuffer) {
   return new Promise((resolve, reject) => {
-    const transport = upstreamUrl.protocol === "https:" ? https : http;
+    const transport = getUpstreamTransport(upstreamUrl);
     const req = transport.request(
       {
         protocol: upstreamUrl.protocol,
@@ -468,6 +657,7 @@ function requestUpstreamJson(upstreamUrl, method, headers, bodyBuffer) {
         port: upstreamUrl.port || undefined,
         method,
         path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
+        agent: getUpstreamAgent(upstreamUrl),
         headers: {
           ...headers,
           "content-length": Buffer.byteLength(bodyBuffer),
@@ -1233,6 +1423,37 @@ async function handleAnthropicMessagesJson(
   logRequestSummary(context, { result: "ok" });
 }
 
+async function handleAnthropicCountTokens(clientReq, clientRes, rawBody) {
+  let requestJson;
+
+  try {
+    requestJson = JSON.parse(rawBody.toString("utf-8"));
+  } catch (error) {
+    sendJson(clientRes, 400, {
+      error: {
+        type: "proxy_bad_request",
+        message: `Invalid JSON request: ${error.message}`,
+      },
+    });
+    return;
+  }
+
+  const context = createRequestLogContext(
+    "count_tokens_local",
+    clientReq.url,
+    0,
+  );
+  const inputTokens = estimateAnthropicCountTokens(requestJson);
+
+  sendJson(clientRes, 200, {
+    input_tokens: inputTokens,
+  });
+  logRequestSummary(context, {
+    result: "ok",
+    inputTokens,
+  });
+}
+
 async function handleAnthropicMessagesStream(
   clientReq,
   clientRes,
@@ -1241,7 +1462,7 @@ async function handleAnthropicMessagesStream(
 ) {
   const upstreamUrl = new URL("/v1/chat/completions", UPSTREAM_BASE_URL);
   const upstreamBody = Buffer.from(JSON.stringify(requestBody), "utf-8");
-  const transport = upstreamUrl.protocol === "https:" ? https : http;
+  const transport = getUpstreamTransport(upstreamUrl);
   const upstreamReq = transport.request(
     {
       protocol: upstreamUrl.protocol,
@@ -1249,6 +1470,7 @@ async function handleAnthropicMessagesStream(
       port: upstreamUrl.port || undefined,
       method: "POST",
       path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
+      agent: getUpstreamAgent(upstreamUrl),
       headers: {
         ...resolveUpstreamHeaders(clientReq.headers),
         "content-length": Buffer.byteLength(upstreamBody),
@@ -1434,7 +1656,7 @@ async function handleAnthropicMessages(clientReq, clientRes, rawBody) {
 
 function proxyPassthrough(clientReq, clientRes, bodyBuffer) {
   const upstreamUrl = new URL(clientReq.url, UPSTREAM_BASE_URL);
-  const transport = upstreamUrl.protocol === "https:" ? https : http;
+  const transport = getUpstreamTransport(upstreamUrl);
 
   const upstreamReq = transport.request(
     {
@@ -1443,6 +1665,7 @@ function proxyPassthrough(clientReq, clientRes, bodyBuffer) {
       port: upstreamUrl.port || undefined,
       method: clientReq.method,
       path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
+      agent: getUpstreamAgent(upstreamUrl),
       headers: {
         ...copyHeaders(clientReq.headers),
         "content-length": Buffer.byteLength(bodyBuffer),
@@ -1477,8 +1700,16 @@ async function handleRequest(clientReq, clientRes) {
 
   if (
     clientReq.method === "POST" &&
-    clientReq.url &&
-    clientReq.url.startsWith("/v1/messages") &&
+    isAnthropicCountTokensPath(clientReq.url) &&
+    contentType.includes("application/json")
+  ) {
+    await handleAnthropicCountTokens(clientReq, clientRes, rawBody);
+    return;
+  }
+
+  if (
+    clientReq.method === "POST" &&
+    isAnthropicMessagesPath(clientReq.url) &&
     contentType.includes("application/json")
   ) {
     await handleAnthropicMessages(clientReq, clientRes, rawBody);
@@ -1498,6 +1729,9 @@ const server = http.createServer((req, res) => {
     });
   });
 });
+server.keepAliveTimeout = 75_000;
+server.headersTimeout = 80_000;
+server.requestTimeout = 0;
 
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.log(

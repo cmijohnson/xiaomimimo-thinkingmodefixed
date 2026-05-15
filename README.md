@@ -21,6 +21,8 @@ This proxy bridges the two formats and keeps the missing reasoning/tool context 
 - full streaming bridge: Anthropic SSE <-> OpenAI chat completions stream
 - non-streaming fallback path for clients that do not request streaming
 - `MIMO_CC_THINKING_MODE=on|off`, defaulting to `on`
+- local fast path for `POST /v1/messages/count_tokens` so token estimation no longer blocks on upstream
+- upstream keep-alive connection pooling for better parallel throughput
 - MiMo `reasoning_content` mapped back to Anthropic `thinking` blocks
 - tool call / tool result roundtrips preserved across turns
 - timing logs for stream mode, first upstream chunk, first emitted Anthropic event, and total time
@@ -75,6 +77,8 @@ MIMO_CC_PROXY_HOST=127.0.0.1
 MIMO_CC_PROXY_PORT=3456
 MIMO_CC_UPSTREAM=http://newai.cmiteam.cn
 MIMO_CC_PROXY_TIMEOUT_MS=300000
+MIMO_CC_PROXY_KEEPALIVE_MS=30000
+MIMO_CC_PROXY_MAX_SOCKETS=64
 MIMO_CC_THINKING_MODE=on
 ```
 
@@ -82,6 +86,8 @@ MIMO_CC_THINKING_MODE=on
 
 - `on`: default, sends `thinking: { type: "enabled" }` upstream
 - `off`: disables MiMo thinking without changing Claude Code config
+- `MIMO_CC_PROXY_KEEPALIVE_MS`: upstream socket keep-alive duration
+- `MIMO_CC_PROXY_MAX_SOCKETS`: max parallel upstream sockets kept in the shared pool
 
 ## How the proxy behaves
 
@@ -101,6 +107,10 @@ MIMO_CC_THINKING_MODE=on
 ### Stream fallback
 
 If the upstream receives `stream: true` but returns a non-SSE JSON body, the proxy converts that full JSON reply into Anthropic-style SSE so Claude Code still gets a streaming-shaped response.
+
+### Count tokens fast path
+
+`POST /v1/messages/count_tokens` is handled locally with a conservative estimate instead of being forwarded upstream. This removes a major source of parallel slowdowns in Claude Code sessions that frequently preflight token counts.
 
 ## Validation commands
 
@@ -147,6 +157,7 @@ This proxy removes the biggest local bottleneck when the previous setup forced n
 
 - MiMo thinking mode itself can add latency
 - very large old Claude Code threads still take longer because the upstream context is large
+- upstream relay rate limits or queueing can still dominate total latency under heavy parallel use
 
 For a fair comparison, validate with a fresh Claude Code conversation.
 
@@ -167,6 +178,7 @@ The proxy writes structured logs like this:
 Useful fields:
 
 - `mode`: `stream` or `json`
+- `mode: "count_tokens_local"`: local token estimate path, which should return quickly without upstream latency
 - `thinkingMode`: `on` or `off`
 - `upstreamConnectedMs`: time to upstream response headers
 - `firstUpstreamChunkMs`: time to first upstream stream chunk

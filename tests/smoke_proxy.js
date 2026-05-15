@@ -401,10 +401,12 @@ function createMockResponse(body, state) {
 async function startMockUpstream() {
   const state = {
     thinkingOffVerified: false,
+    upstreamRequestCount: 0,
   };
 
   const server = http.createServer(async (req, res) => {
     try {
+      state.upstreamRequestCount += 1;
       assert.equal(req.method, "POST");
       assert.equal(req.url, "/v1/chat/completions");
       const body = await readJson(req);
@@ -518,7 +520,7 @@ function stopProxy(child) {
   });
 }
 
-function requestProxy(port, body) {
+function requestProxy(port, body, requestPath = "/v1/messages") {
   return new Promise((resolve, reject) => {
     const payload = Buffer.from(JSON.stringify(body), "utf-8");
     const req = http.request(
@@ -526,7 +528,7 @@ function requestProxy(port, body) {
         host: "127.0.0.1",
         port,
         method: "POST",
-        path: "/v1/messages",
+        path: requestPath,
         headers: {
           "content-type": "application/json",
           "content-length": payload.length,
@@ -608,6 +610,43 @@ async function run() {
     assert.equal(pingResponse.statusCode, 200);
     assert.equal(pingResponse.json?.content?.[0]?.type, "thinking");
     assert.equal(pingResponse.json?.content?.[1]?.text, "pong");
+
+    const upstreamCountBeforeCountTokens = mock.state.upstreamRequestCount;
+    const countTokensResponse = await requestProxy(
+      proxy.proxyPort,
+      {
+        model: "mimo-v2.5-pro",
+        system: "Count these tokens quickly.",
+        messages: [
+          {
+            role: "user",
+            content: "帮我快速估算一下这一段上下文需要多少 token。",
+          },
+        ],
+        tools: [
+          {
+            name: "add",
+            description: "Add two numbers",
+            input_schema: {
+              type: "object",
+              properties: {
+                a: { type: "number" },
+                b: { type: "number" },
+              },
+              required: ["a", "b"],
+            },
+          },
+        ],
+      },
+      "/v1/messages/count_tokens?beta=true",
+    );
+    assert.equal(countTokensResponse.statusCode, 200);
+    assert.ok(Number.isInteger(countTokensResponse.json?.input_tokens));
+    assert.ok(countTokensResponse.json.input_tokens > 0);
+    assert.equal(
+      mock.state.upstreamRequestCount,
+      upstreamCountBeforeCountTokens,
+    );
 
     const toolRoundOne = await requestProxy(proxy.proxyPort, {
       model: "mimo-v2.5-pro",
